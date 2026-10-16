@@ -17,9 +17,9 @@ use mail_builder::{
     MessageBuilder,
     headers::{address::Address, message_id::generate_message_id_header, raw::Raw},
 };
-use mail_parser::{HeaderValue, MessageParser, parsers::MessageStream};
+use mail_parser::{HeaderValue, MessageParser, PartType, parsers::MessageStream};
 
-use crate::config::PostingStyle;
+use crate::{config::PostingStyle, shared::message::part};
 
 /// Everything the MIME assembler needs, which each command fills in from
 /// its own clap struct.
@@ -65,6 +65,9 @@ pub struct SourceArgs<'a> {
     pub posting_style: PostingStyle,
     /// The headline placed before its quoted body.
     pub quote_headline: &'a str,
+    /// Whether the attachments of the source are left out of a
+    /// forward, the quoting being all a reply ever took.
+    pub no_attachments: bool,
     /// Whether a reply also goes to the other recipients of the source.
     pub reply_all: bool,
     /// The account's own address, left out of a reply to all.
@@ -196,9 +199,50 @@ pub fn build(args: BuilderArgs<'_>, source: Option<SourceArgs<'_>>) -> Result<Ve
         builder = builder.attachment(mime, file_name, bytes);
     }
 
+    if let (Some(source), Some(parsed)) = (source.as_ref(), parsed_source.as_ref())
+        && source.mode == SourceMode::Forward
+        && !source.no_attachments
+    {
+        builder = carry_source_attachments(builder, parsed);
+    }
+
     builder
         .write_to_vec()
         .map_err(|err| anyhow!("serialize composed message: {err}"))
+}
+
+/// Carries the attachments of the source into the forward, each under
+/// the file name the source gave it: the parts the source itself
+/// disposed as attachments, the bodies and the inline resources being
+/// left to the quoting. A part the source left nameless is skipped
+/// rather than renamed, an anonymous attachment being of no use to the
+/// recipient.
+fn carry_source_attachments<'a>(
+    builder: MessageBuilder<'a>,
+    parsed: &mail_parser::Message<'_>,
+) -> MessageBuilder<'a> {
+    let mut builder = builder;
+
+    for part in &parsed.parts {
+        // NOTE: a multipart container is not a leaf part: it holds no
+        // bytes of its own, and a `name` attribute on it would pass the
+        // attachment role fallthrough, so skip containers before the
+        // role check.
+        if matches!(&part.body, PartType::Multipart(_)) {
+            continue;
+        }
+        if part::role(parsed, part) != part::PartRole::Attachment {
+            continue;
+        }
+        let Some(file_name) = part::filename(parsed, part) else {
+            continue;
+        };
+        let mime = part::mime(part);
+        let bytes = part::bytes(parsed, part).into_owned();
+        builder = builder.attachment(mime, file_name, bytes);
+    }
+
+    builder
 }
 
 /// Generates a `Message-ID` on the domain of the sender's address.
@@ -551,6 +595,7 @@ Original body line.\r\n";
             mode,
             posting_style: PostingStyle::Top,
             quote_headline: "On a day, Alice wrote:",
+            no_attachments: true,
             reply_all: false,
             own_email: None,
         }
@@ -672,6 +717,7 @@ Original body line.\r\n";
             mode: SourceMode::Reply,
             posting_style: PostingStyle::Top,
             quote_headline: "",
+            no_attachments: true,
             reply_all: false,
             own_email: None,
         };
@@ -688,6 +734,7 @@ Original body line.\r\n";
             mode: SourceMode::Reply,
             posting_style: PostingStyle::Top,
             quote_headline: "",
+            no_attachments: true,
             reply_all: false,
             own_email: None,
         };
@@ -730,6 +777,7 @@ Body.\r\n";
             mode: SourceMode::Reply,
             posting_style: PostingStyle::Top,
             quote_headline: "",
+            no_attachments: true,
             reply_all,
             own_email: Some("me@example.com"),
         };
@@ -774,6 +822,7 @@ Body.\r\n";
                 mode: SourceMode::Reply,
                 posting_style: PostingStyle::Top,
                 quote_headline: "",
+                no_attachments: true,
                 reply_all: true,
                 own_email: Some("me@example.com"),
             }),
